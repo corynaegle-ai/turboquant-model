@@ -20,7 +20,14 @@ import torch.nn as nn
 from turboquant_model.rotation import generate_rotation_matrix
 from turboquant_model.quantize import unpack_4bit
 
-# Try to import Triton fused kernel — falls back to PyTorch if unavailable
+# Try to import fused kernels — prefers cuTile > Triton > PyTorch fallback
+_HAS_CUTILE = False
+try:
+    from turboquant_model.cutile_kernels import cutile_fused_matmul
+    _HAS_CUTILE = True
+except ImportError:
+    pass
+
 _HAS_TRITON = False
 try:
     from turboquant_model.triton_kernels import triton_fused_matmul
@@ -109,7 +116,8 @@ class TurboQuantLinear(nn.Module):
         self._cached_pass2_indices: Optional[torch.Tensor] = None
         self._n_groups: int = math.ceil(in_features / self.group_size)
 
-        # Triton fused kernel: skip intermediate unpack + codebook tensor
+        # Fused kernel priority: cuTile > Triton > PyTorch fallback
+        self.use_cutile: bool = _HAS_CUTILE
         self.use_triton: bool = _HAS_TRITON
 
     def set_rotation(self, seed: int):
@@ -211,7 +219,14 @@ class TurboQuantLinear(nn.Module):
             else:
                 norms_g = weight_norms[:, g]  # (N,) — per-group norms
 
-            if self.use_triton and g_dim == self.group_size:
+            if self.use_cutile and g_dim == self.group_size:
+                # cuTile fused path: unpack + codebook lookup + matmul in one kernel
+                packed_g = indices_packed[:, g_start // 2 : g_end // 2]
+                out_g = cutile_fused_matmul(
+                    x_rot_g.contiguous(), packed_g.contiguous(),
+                    codebook, norms_g.contiguous(), g_dim, scale,
+                )
+            elif self.use_triton and g_dim == self.group_size:
                 # Triton fused path: unpack + codebook lookup + matmul in one kernel
                 packed_g = indices_packed[:, g_start // 2 : g_end // 2]  # (N, g_dim//2)
                 out_g = triton_fused_matmul(
@@ -244,7 +259,8 @@ class TurboQuantLinear(nn.Module):
         x_f = x.float()
 
         # Pass 1
-        indices = None if self.use_triton else self._get_indices()
+        _use_fused = self.use_cutile or self.use_triton
+        indices = None if _use_fused else self._get_indices()
         output = self._forward_pass(
             x_f, indices, self.indices_packed, self.codebook,
             self.weight_norms, self._rotation_seed,
@@ -252,7 +268,7 @@ class TurboQuantLinear(nn.Module):
 
         # Pass 2 (residual) if present
         if self.has_residual:
-            indices2 = None if self.use_triton else self._get_pass2_indices()
+            indices2 = None if _use_fused else self._get_pass2_indices()
             output += self._forward_pass(
                 x_f, indices2, self.pass2_indices_packed, self.pass2_codebook,
                 self.pass2_weight_norms, self._pass2_seed,

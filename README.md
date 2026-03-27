@@ -137,16 +137,27 @@ The original TurboQuant paper defines **TurboQuant_prod** — a variant that app
 | **4+4 residual g=128** | **8** | **10.70** | **+0.03** | **0.0028** |
 | 4-bit g=128 | 4 | 11.28 | +0.61 | 0.0852 |
 
-### Triton Fused Kernel
+### Fused Kernel Benchmarks
 
-The Triton kernel fuses 4-bit unpack + codebook lookup + matmul + norm rescale in a single kernel launch, avoiding intermediate tensor materialization. Auto-enabled when Triton is available.
+Fused kernels (CuTile, Triton) combine 4-bit unpack + codebook lookup + matmul + norm rescale in a single kernel launch, avoiding intermediate tensor materialization. Auto-enabled when available (priority: CuTile > Triton > PyTorch fallback).
 
-| Path | Latency (ms/fwd) | Peak GPU (MB) | Speedup |
-|------|-------------------|---------------|---------|
-| **Triton** (fused) | 380 | **1,074** | 1.10x |
-| PyTorch (fallback) | 420 | 4,408 | 1.0x |
+#### Qwen3.5-0.8B-Base (4-bit g=128)
 
-**4x peak memory reduction** (4,408 → 1,074 MB) by never materializing the (N, K) float32 `codebook[indices]` tensor. Disable per-module with `m.use_triton = False`.
+| Path | Latency (ms/fwd) | Peak GPU (MB) | Speedup | Memory Reduction |
+|------|-------------------|---------------|---------|------------------|
+| **CuTile** (fused) | **651** | **1,086** | **1.08x** | **4.5x** |
+| PyTorch (fallback) | 703 | 4,883 | 1.0x | — |
+
+#### Qwen3.5-4B (4-bit g=128)
+
+| Path | Latency (ms/fwd) | Peak GPU (MB) | Speedup | Memory Reduction |
+|------|-------------------|---------------|---------|------------------|
+| **CuTile** (fused) | **1,629** | **3,960** | **2.40x** | **5.6x** |
+| PyTorch (fallback) | 3,904 | 22,384 | 1.0x | — |
+
+CuTile provides significant memory savings by never materializing the (N, K) float32 `codebook[indices]` tensor, with latency improvements that scale with model size. Disable per-module with `m.use_cutile = False`.
+
+Triton kernels provide similar benefits on Linux. Disable with `m.use_triton = False`.
 
 ## Architecture
 
@@ -156,6 +167,7 @@ turboquant_model/
 ├── rotation.py          # QR random rotation matrices
 ├── quantize.py          # Single-pass quantize + pack/unpack
 ├── residual.py          # Residual (two-pass) quantization
+├── cutile_kernels.py    # Fused CuTile matmul kernel (optional)
 ├── triton_kernels.py    # Fused Triton matmul kernel (optional)
 ├── module.py            # TurboQuantLinear (nn.Module)
 ├── model.py             # quantize_model, save/load, config

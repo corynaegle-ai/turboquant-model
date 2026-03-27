@@ -17,6 +17,9 @@ transformers = [
     "transformers>=4.40",
     "accelerate",
 ]
+cutile = [
+    "cuda-tile[tileiras]",
+]
 dev = [
     "pytest",
     "pytest-cov",
