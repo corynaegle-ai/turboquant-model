@@ -50,6 +50,7 @@ def cmd_quantize(args: argparse.Namespace):
         skip_lm_head=args.skip_lm_head,
         residual_bit_width=args.residual_bit_width,
         residual_seed=args.residual_seed,
+        rotation=args.rotation,
     )
 
     logger.info(f"Quantizing: {config.bit_width}-bit"
@@ -88,6 +89,7 @@ def cmd_eval(args: argparse.Namespace):
             seed=args.seed,
             residual_bit_width=args.residual_bit_width,
             residual_seed=args.residual_seed,
+            rotation=args.rotation,
         )
         model = quantize_model(model, config)
 
@@ -251,6 +253,8 @@ def main():
     p_quant.add_argument("--skip-lm-head", action="store_true")
     p_quant.add_argument("--residual-bit-width", type=int, default=None, help="Bits for residual pass")
     p_quant.add_argument("--residual-seed", type=int, default=1042)
+    p_quant.add_argument("--rotation", choices=["qr", "hadamard"], default="qr",
+                         help="Rotation method: qr (Haar random) or hadamard (fast Walsh-Hadamard)")
 
     # --- eval ---
     p_eval = subparsers.add_parser("eval", help="Evaluate PPL on WikiText-103")
@@ -264,6 +268,8 @@ def main():
     p_eval.add_argument("--seq-length", type=int, default=512)
     p_eval.add_argument("--n-chunks", type=int, default=50)
     p_eval.add_argument("--kld", action="store_true", help="Compute KL divergence vs. reference model")
+    p_eval.add_argument("--rotation", choices=["qr", "hadamard"], default="qr",
+                        help="Rotation method: qr or hadamard")
 
     # --- generate ---
     p_gen = subparsers.add_parser("generate", help="Generate text")

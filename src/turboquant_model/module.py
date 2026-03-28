@@ -17,7 +17,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from turboquant_model.rotation import generate_rotation_matrix
+from turboquant_model.rotation import (
+    generate_rotation_matrix,
+    hadamard_rotate,
+    hadamard_rotate_inverse,
+)
 from turboquant_model.quantize import unpack_4bit
 
 # Try to import fused kernels — prefers cuTile > Triton > PyTorch fallback
@@ -59,6 +63,7 @@ class TurboQuantLinear(nn.Module):
         bit_width: int = 4,
         group_size: Optional[int] = None,
         device: Optional[torch.device] = None,
+        rotation: str = "qr",
     ):
         super().__init__()
         self.in_features = in_features
@@ -66,6 +71,7 @@ class TurboQuantLinear(nn.Module):
         self.bit_width = bit_width
         self.group_size = group_size or in_features
         self.n_levels = 2**bit_width
+        self.rotation = rotation
 
         pack_factor = 8 // bit_width
         packed_dim = math.ceil(in_features / pack_factor)
@@ -210,8 +216,11 @@ class TurboQuantLinear(nn.Module):
             g_dim = g_end - g_start
 
             # Rotate this group's input slice
-            Pi_g = self._get_rotation(seed, g_start).to(device)
-            x_rot_g = x[:, g_start:g_end] @ Pi_g.T  # (B, g_dim)
+            if self.rotation == "hadamard":
+                x_rot_g = hadamard_rotate(x[:, g_start:g_end], seed + g_start)
+            else:
+                Pi_g = self._get_rotation(seed, g_start).to(device)
+                x_rot_g = x[:, g_start:g_end] @ Pi_g.T  # (B, g_dim)
 
             # Per-group norms
             if weight_norms.dim() == 1:
@@ -297,9 +306,13 @@ class TurboQuantLinear(nn.Module):
             g_start = g * self.group_size
             g_end = min(g_start + self.group_size, self.in_features)
 
-            Pi_g = self._get_rotation(self._rotation_seed, g_start)
-            Y_g = self.codebook[indices[:, g_start:g_end].long()] / scale
-            W_g = Y_g @ Pi_g[:g_end - g_start, :g_end - g_start]
+            if self.rotation == "hadamard":
+                Y_g = self.codebook[indices[:, g_start:g_end].long()] / scale
+                W_g = hadamard_rotate_inverse(Y_g, self._rotation_seed + g_start)
+            else:
+                Pi_g = self._get_rotation(self._rotation_seed, g_start)
+                Y_g = self.codebook[indices[:, g_start:g_end].long()] / scale
+                W_g = Y_g @ Pi_g[:g_end - g_start, :g_end - g_start]
 
             if self.weight_norms.dim() == 1:
                 W_g = W_g * self.weight_norms.unsqueeze(1)
@@ -313,9 +326,13 @@ class TurboQuantLinear(nn.Module):
             for g in range(self._n_groups):
                 g_start = g * self.group_size
                 g_end = min(g_start + self.group_size, self.in_features)
-                Pi2_g = self._get_rotation(self._pass2_seed, g_start)
-                Y_g = self.pass2_codebook[indices2[:, g_start:g_end].long()] / scale
-                W_g = Y_g @ Pi2_g[:g_end - g_start, :g_end - g_start]
+                if self.rotation == "hadamard":
+                    Y_g = self.pass2_codebook[indices2[:, g_start:g_end].long()] / scale
+                    W_g = hadamard_rotate_inverse(Y_g, self._pass2_seed + g_start)
+                else:
+                    Pi2_g = self._get_rotation(self._pass2_seed, g_start)
+                    Y_g = self.pass2_codebook[indices2[:, g_start:g_end].long()] / scale
+                    W_g = Y_g @ Pi2_g[:g_end - g_start, :g_end - g_start]
                 if self.pass2_weight_norms.dim() == 1:
                     W_g = W_g * self.pass2_weight_norms.unsqueeze(1)
                 else:

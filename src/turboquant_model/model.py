@@ -20,6 +20,11 @@ from turboquant_model.codebook import get_codebook
 from turboquant_model.rotation import generate_rotation_matrix
 from turboquant_model.quantize import pack_4bit
 from turboquant_model.module import TurboQuantLinear
+from turboquant_model.rotation import (
+    generate_rotation_matrix,
+    hadamard_rotate,
+    hadamard_rotate_inverse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,8 @@ class TurboQuantConfig:
     # Residual
     residual_bit_width: Optional[int] = None
     residual_seed: int = 1042
+    # Rotation method: "qr" (Haar random orthogonal) or "hadamard" (fast Walsh-Hadamard + signs)
+    rotation: str = "qr"
 
     def save(self, path: str | Path):
         with open(path, "w") as f:
@@ -98,7 +105,8 @@ def quantize_model(model: nn.Module, config: TurboQuantConfig) -> nn.Module:
 
         # --- Pass 1: Quantize weight ---
         pass1_packed, pass1_norms, pass1_codebook = _quantize_weight(
-            W, config.bit_width, group_size, config.seed, centroids, boundaries, device
+            W, config.bit_width, group_size, config.seed, centroids, boundaries, device,
+            rotation=config.rotation,
         )
 
         # --- Create TurboQuantLinear ---
@@ -109,6 +117,7 @@ def quantize_model(model: nn.Module, config: TurboQuantConfig) -> nn.Module:
             bit_width=config.bit_width,
             group_size=group_size,
             device=device,
+            rotation=config.rotation,
         )
         tq.indices_packed.copy_(pass1_packed)
         tq.weight_norms.copy_(pass1_norms)
@@ -126,7 +135,8 @@ def quantize_model(model: nn.Module, config: TurboQuantConfig) -> nn.Module:
 
             pass2_packed, pass2_norms, pass2_codebook = _quantize_weight(
                 residual, config.residual_bit_width, group_size,
-                config.residual_seed, r_centroids, r_boundaries, device
+                config.residual_seed, r_centroids, r_boundaries, device,
+                rotation=config.rotation,
             )
             tq.set_pass2(
                 indices_packed=pass2_packed,
@@ -162,6 +172,7 @@ def _quantize_weight(
     centroids: torch.Tensor,
     boundaries: torch.Tensor,
     device: torch.device,
+    rotation: str = "qr",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a single weight matrix and return packed data.
 
@@ -185,8 +196,11 @@ def _quantize_weight(
         W_norm = W_g / norms
         all_norms.append(norms.squeeze(1))
 
-        Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
-        Y = W_norm @ Pi.T
+        if rotation == "hadamard":
+            Y = hadamard_rotate(W_norm, seed=seed + g_start)
+        else:
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            Y = W_norm @ Pi.T
         scale = math.sqrt(g_dim)
         Y_scaled = Y * scale
 
@@ -333,6 +347,7 @@ def load_quantized(
             bit_width=config.bit_width,
             group_size=group_size,
             device=device,
+            rotation=config.rotation,
         )
 
         tq.indices_packed = torch.load(indices_path, map_location=device, weights_only=True)

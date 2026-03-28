@@ -72,7 +72,7 @@ turboquant benchmark --model Qwen/Qwen3.5-0.8B-Base --bit-width 4
 ### TurboQuant Algorithm
 
 1. **Row-normalize** each weight row to unit norm, store the norm separately
-2. **Random rotation** (QR decomposition of Gaussian matrix) — maps coordinates to near-independent N(0, 1/d)
+2. **Random rotation** (QR decomposition or fast Walsh–Hadamard + random signs) — maps coordinates to near-independent N(0, 1/d)
 3. **Lloyd-Max scalar quantization** per coordinate — optimal for Gaussian distribution
 4. **Pack** indices into 4-bit format (2 per byte)
 
@@ -161,12 +161,24 @@ Fused kernels (CuTile, Triton) combine 4-bit unpack + codebook lookup + matmul +
 
 Both fused kernels provide massive memory savings by never materializing the (N, K) float32 `codebook[indices]` tensor. CuTile edges out Triton in both latency and memory. Speedup scales dramatically with model size (1.1x → 4.0x). Disable per-module with `m.use_cutile = False` or `m.use_triton = False`.
 
+### Rotation Method Comparison (Qwen3.5-0.8B-Base, g=128)
+
+Two rotation methods: **QR** (Haar-distributed random orthogonal, O(d²) storage/compute) and **Hadamard** (fast Walsh–Hadamard + random signs, O(d) storage, O(d log d) compute).
+
+| Config | QR PPL | QR KLD | Hadamard PPL | Hadamard KLD |
+|--------|--------|--------|-------------|-------------|
+| 4+4 residual | 14.28 | 0.0020 | 14.30 | 0.0020 |
+| 4+2 residual | 14.46 | 0.0159 | 14.49 | 0.0148 |
+| 4-bit | 16.58 | 0.1403 | 16.35 | 0.1394 |
+
+Hadamard matches QR quality across all configs while using O(d) vs O(d²) storage. Use `--rotation hadamard` to enable.
+
 ## Architecture
 
 ```
 turboquant_model/
 ├── codebook.py          # Lloyd-Max optimal codebook (precomputed)
-├── rotation.py          # QR random rotation matrices
+├── rotation.py          # Random rotation: QR (Haar) or fast Walsh-Hadamard + signs
 ├── quantize.py          # Single-pass quantize + pack/unpack
 ├── residual.py          # Residual (two-pass) quantization
 ├── cutile_kernels.py    # Fused CuTile matmul kernel (optional)

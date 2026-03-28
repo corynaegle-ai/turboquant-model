@@ -12,7 +12,11 @@ from typing import Optional
 import torch
 
 from turboquant_model.codebook import get_codebook
-from turboquant_model.rotation import generate_rotation_matrix
+from turboquant_model.rotation import (
+    generate_rotation_matrix,
+    hadamard_rotate,
+    hadamard_rotate_inverse,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,7 @@ def turboquant_quantize(
     bit_width: int = 4,
     group_size: Optional[int] = None,
     seed: int = 42,
+    rotation: str = "qr",
 ) -> torch.Tensor:
     """Apply TurboQuant quantization and return the dequantized approximation.
 
@@ -79,6 +84,7 @@ def turboquant_quantize(
         bit_width: bits per coordinate
         group_size: group size along in_features (None = full row)
         seed: rotation seed
+        rotation: "qr" or "hadamard"
 
     Returns:
         W_approx: same shape/dtype as W
@@ -104,8 +110,11 @@ def turboquant_quantize(
         norms = W_g.norm(dim=1, keepdim=True).clamp(min=1e-8)
         W_norm = W_g / norms
 
-        Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(W.device)
-        Y = W_norm @ Pi.T
+        if rotation == "hadamard":
+            Y = hadamard_rotate(W_norm, seed=seed + g_start)
+        else:
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(W.device)
+            Y = W_norm @ Pi.T
         scale = math.sqrt(g_dim)
         Y_scaled = Y * scale
 
@@ -114,7 +123,10 @@ def turboquant_quantize(
         Y_quant = centroids[indices].reshape(Y_scaled.shape)
 
         Y_unscaled = Y_quant / scale
-        W_g_approx = Y_unscaled @ Pi
+        if rotation == "hadamard":
+            W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
+        else:
+            W_g_approx = Y_unscaled @ Pi
         W_approx[:, g_start:g_end] = W_g_approx * norms
 
     return W_approx.to(orig_dtype)
