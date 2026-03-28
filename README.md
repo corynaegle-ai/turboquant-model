@@ -145,19 +145,19 @@ Fused kernels (CuTile, Triton) combine 4-bit unpack + codebook lookup + matmul +
 
 | Path | Latency (ms/fwd) | Peak GPU (MB) | Speedup | Memory Reduction |
 |------|-------------------|---------------|---------|------------------|
-| **CuTile** (fused) | **651** | **1,086** | **1.08x** | **4.5x** |
-| PyTorch (fallback) | 703 | 4,883 | 1.0x | — |
+| **CuTile** (fused) | **340** | **1,086** | **1.10x** | **4.5x** |
+| Triton (fused) | 386 | 1,334 | 0.97x | 3.7x |
+| PyTorch (fallback) | 373 | 4,883 | 1.0x | — |
 
 #### Qwen3.5-4B (4-bit g=128)
 
 | Path | Latency (ms/fwd) | Peak GPU (MB) | Speedup | Memory Reduction |
 |------|-------------------|---------------|---------|------------------|
-| **CuTile** (fused) | **1,629** | **3,960** | **2.40x** | **5.6x** |
-| PyTorch (fallback) | 3,904 | 22,384 | 1.0x | — |
+| **CuTile** (fused) | **968** | **3,954** | **3.98x** | **5.7x** |
+| Triton (fused) | 1,098 | 4,119 | 3.51x | 5.4x |
+| PyTorch (fallback) | 3,855 | 22,377 | 1.0x | — |
 
-CuTile provides significant memory savings by never materializing the (N, K) float32 `codebook[indices]` tensor, with latency improvements that scale with model size. Disable per-module with `m.use_cutile = False`.
-
-Triton kernels provide similar benefits on Linux. Disable with `m.use_triton = False`.
+Both fused kernels provide massive memory savings by never materializing the (N, K) float32 `codebook[indices]` tensor. CuTile edges out Triton in both latency and memory. Speedup scales dramatically with model size (1.1x → 4.0x). Disable per-module with `m.use_cutile = False` or `m.use_triton = False`.
 
 ## Architecture
 
