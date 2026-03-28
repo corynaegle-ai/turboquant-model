@@ -118,6 +118,7 @@ The original TurboQuant paper defines **TurboQuant_prod** — a variant that app
 |--------|-----------|----------|-----|-------|-----|-----------------|----------|
 | Baseline bf16 | 16 | — | 14.29 | — | — | 1,504 MB | — |
 | **4+4 residual g=128** | **8** | **16+16 (128 B)** | **14.28** | **−0.01** | **0.0020** | **762 MB** | 9.7 GB |
+| 4+2 residual g=128 | 6 | 16+4 (80 B) | 14.46 | +0.17 | 0.0159 | 762 MB | 9.7 GB |
 | 3+2 residual g=128 | 5 | 8+4 (48 B) | 15.15 | +0.86 | 0.0545 | 762 MB | 9.7 GB |
 | 4-bit g=full | 4 | 16 (64 B) | 16.22 | +1.93 | 0.1363 | 361 MB | 9.6 GB |
 | 4-bit g=128 | 4 | 16 (64 B) | 16.58 | +2.29 | 0.1403 | 381 MB | 5.8 GB |
@@ -135,6 +136,7 @@ The original TurboQuant paper defines **TurboQuant_prod** — a variant that app
 |--------|-----------|-----|-------|-----|
 | Baseline bf16 | 16 | 10.67 | — | — |
 | **4+4 residual g=128** | **8** | **10.70** | **+0.03** | **0.0028** |
+| 4+2 residual g=128 | 6 | 10.65 | −0.02 | 0.0133 |
 | 4-bit g=128 | 4 | 11.28 | +0.61 | 0.0852 |
 
 ### Fused Kernel Benchmarks
