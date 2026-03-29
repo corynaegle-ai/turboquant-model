@@ -10,3 +10,4 @@ wheels/
 .venv
 .github
 logs
+tests/report_qwen3_5.json
