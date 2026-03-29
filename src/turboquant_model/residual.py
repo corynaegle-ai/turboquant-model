@@ -32,7 +32,11 @@ from typing import Optional
 
 import torch
 
-from turboquant_model.codebook import get_codebook
+from turboquant_model.codebook import (
+    get_codebook,
+    get_hierarchical_codebook,
+    fit_hierarchical_codebook,
+)
 from turboquant_model.rotation import generate_rotation_matrix
 from turboquant_model.quantize import (
     turboquant_quantize,
@@ -405,4 +409,171 @@ def merge_and_requantize(
         "group_size": group_size,
         "shape": (M, N),
         "bit_width": target_bit_width,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical successive-refinement merge (HSR)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def merge_and_requantize_hierarchical(
+    packed_data: dict,
+    coarse_bits: int = 3,
+    refine_bits: int = 1,
+    fit_codebook: bool = False,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """Merge N shared-rotation passes and re-quantize with a hierarchical codebook.
+
+    Operates identically to ``merge_and_requantize`` but replaces the flat
+    ``2^target_bit_width`` Lloyd-Max codebook with a **hierarchical
+    successive-refinement (HSR)** codebook:
+
+      * Coarse stage: ``2^coarse_bits`` centroids (Lloyd-Max).
+      * Refinement stage: within each coarse Voronoi region,
+        ``2^refine_bits`` sub-centroids (Lloyd-Max on truncated distribution).
+
+    The total index width is ``coarse_bits + refine_bits`` (default 4),
+    so the packed representation has the same storage cost as a flat
+    4-bit codebook while capturing the hierarchical structure of the
+    merged multi-pass rotated-domain target.
+
+    When ``fit_codebook=True``, the codebook is fitted from the actual merged
+    rotated-domain values via empirical Lloyd-Max, as described in the HSR-4
+    approach: "Run Lloyd-Max on the distribution of ỹ_g."  This produces
+    centroids conditioned on the multi-residual target, providing better
+    rate-distortion than the pre-computed Gaussian codebook.
+
+    Dequantization is fully compatible with the standard path::
+
+        value = codebook[index]           # flat lookup (16 entries)
+
+    or equivalently::
+
+        coarse_id = index // n_refine
+        refine_id = index %  n_refine
+        value = coarse_centroids[coarse_id] + refine_offsets[coarse_id, refine_id]
+
+    Args:
+        packed_data: output of ``multi_residual_quantize_packed``
+        coarse_bits: bits for the coarse stage (default 3)
+        refine_bits: bits for the refinement stage (default 1)
+        fit_codebook: if True, fit codebook from the merged data (data-dependent);
+            if False (default), use the pre-computed N(0,1) codebook
+        device: target device (default: CPU)
+
+    Returns:
+        dict with standard packed keys (``indices_packed``, ``codebook``,
+        ``norms``, ``seed``, ``group_size``, ``shape``, ``bit_width``) plus
+        hierarchical metadata:
+            coarse_codebook: (n_coarse,) coarse centroids
+            refine_offsets: (n_coarse, n_refine) per-child offsets
+            coarse_bits: int
+            refine_bits: int
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    passes = packed_data["passes"]
+    seed = packed_data["shared_seed"]
+    M, N = passes[0]["shape"]
+    group_size = passes[0]["group_size"]
+    n_groups = math.ceil(N / group_size)
+    total_bits = coarse_bits + refine_bits
+
+    # ------------------------------------------------------------------
+    # Phase 1: Compute merged rotated-domain values for all groups
+    # ------------------------------------------------------------------
+    all_Y_scaled: list[torch.Tensor] = []
+    all_merged_norms: list[torch.Tensor] = []
+
+    for g in range(n_groups):
+        g_start = g * group_size
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+        scale = math.sqrt(g_dim)
+
+        Y_merged = torch.zeros(M, g_dim, dtype=torch.float32, device=device)
+
+        for pass_data in passes:
+            cb = pass_data["codebook"].to(device)
+            norms = pass_data["norms"].to(device)
+            ip = pass_data["indices_packed"].to(device)
+
+            indices = unpack_4bit(ip, N if N % 2 == 0 else N + 1)[:, :N]
+            idx_g = indices[:, g_start:g_end].long()
+            Y_g = cb[idx_g] / scale
+
+            if norms.dim() == 1:
+                Y_g = Y_g * norms.unsqueeze(1)
+            else:
+                Y_g = Y_g * norms[:, g].unsqueeze(1)
+
+            Y_merged += Y_g
+
+        merged_norms = Y_merged.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        Y_normalized = Y_merged / merged_norms
+        Y_scaled = Y_normalized * scale
+
+        all_Y_scaled.append(Y_scaled)
+        all_merged_norms.append(merged_norms.squeeze(1))
+
+    # ------------------------------------------------------------------
+    # Phase 2: Obtain hierarchical codebook
+    # ------------------------------------------------------------------
+    if fit_codebook:
+        # Fit codebook from the actual merged data
+        all_values = torch.cat([ys.reshape(-1) for ys in all_Y_scaled])
+        flat_centroids, flat_boundaries, coarse_centroids, refine_offsets = (
+            fit_hierarchical_codebook(all_values, coarse_bits, refine_bits)
+        )
+    else:
+        flat_centroids, flat_boundaries, coarse_centroids, refine_offsets = (
+            get_hierarchical_codebook(coarse_bits, refine_bits)
+        )
+
+    flat_centroids = flat_centroids.to(device)
+    flat_boundaries = flat_boundaries.to(device)
+
+    # ------------------------------------------------------------------
+    # Phase 3: Re-quantize each group using hierarchical codebook
+    # ------------------------------------------------------------------
+    all_merged_indices: list[torch.Tensor] = []
+
+    for g, Y_scaled in enumerate(all_Y_scaled):
+        g_start = g * group_size
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+
+        idx = torch.searchsorted(flat_boundaries, Y_scaled.reshape(-1))
+        idx = idx.clamp(0, len(flat_centroids) - 1).reshape(M, g_dim)
+        all_merged_indices.append(idx)
+
+    full_indices = torch.cat(all_merged_indices, dim=1)
+    norms_out = (
+        torch.stack(all_merged_norms, dim=1)
+        if len(all_merged_norms) > 1
+        else all_merged_norms[0]
+    )
+
+    if N % 2 != 0:
+        full_indices = torch.nn.functional.pad(full_indices, (0, 1), value=0)
+
+    packed = pack_4bit(full_indices)
+
+    return {
+        "indices_packed": packed,
+        "codebook": flat_centroids.cpu(),
+        "norms": norms_out.cpu(),
+        "seed": seed,
+        "group_size": group_size,
+        "shape": (M, N),
+        "bit_width": total_bits,
+        # Hierarchical structure
+        "coarse_codebook": coarse_centroids.cpu(),
+        "refine_offsets": refine_offsets.cpu(),
+        "coarse_bits": coarse_bits,
+        "refine_bits": refine_bits,
     }

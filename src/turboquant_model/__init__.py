@@ -13,7 +13,11 @@ Usage:
     enable_fused_mode(model)
 """
 
-from turboquant_model.codebook import get_codebook
+from turboquant_model.codebook import (
+    get_codebook,
+    get_hierarchical_codebook,
+    fit_hierarchical_codebook,
+)
 from turboquant_model.rotation import generate_rotation_matrix
 from turboquant_model.quantize import (
     pack_4bit,
@@ -28,6 +32,7 @@ from turboquant_model.residual import (
     multi_residual_quantize_packed,
     merge_residual_passes,
     merge_and_requantize,
+    merge_and_requantize_hierarchical,
 )
 from turboquant_model.module import TurboQuantLinear
 from turboquant_model.model import (
@@ -42,6 +47,8 @@ __version__ = "0.1.0"
 __all__ = [
     # Codebook
     "get_codebook",
+    "get_hierarchical_codebook",
+    "fit_hierarchical_codebook",
     # Rotation
     "generate_rotation_matrix",
     # Quantize
@@ -56,6 +63,7 @@ __all__ = [
     "multi_residual_quantize_packed",
     "merge_residual_passes",
     "merge_and_requantize",
+    "merge_and_requantize_hierarchical",
     # Module
     "TurboQuantLinear",
     # Model
