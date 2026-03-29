@@ -23,6 +23,19 @@ rotated-domain matrix**.  This enables:
   3. Re-quantizing the merged representation for compressed single-pass
      inference — the merge and re-quantize operate entirely in the rotated
      domain, avoiding any inverse rotation computation.
+
+Hierarchical successive-refinement (HSR)
+-----------------------------------------
+``merge_and_requantize_hierarchical`` extends the merge path with a
+two-stage **HSR-4** codebook (e.g., 3-bit coarse + 1-bit refine = 4-bit
+total).  The refinement stage sub-divides each coarse Voronoi region,
+capturing the distribution of the merged multi-pass target Ỹ more
+faithfully than a flat 4-bit codebook.  Two codebook modes are supported:
+
+  * Pre-computed (default): Lloyd-Max on N(0,1) — no fitting step.
+  * Data-dependent (``fit_codebook=True``): Lloyd-Max on the actual
+    merged values — produces centroids conditioned on the multi-residual
+    target.
 """
 
 from __future__ import annotations
