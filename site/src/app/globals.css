@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0d1117;
+  --bg2: #161b22;
+  --bg3: #1c2128;
+  --accent: #58a6ff;
+  --accent-green: #7ee787;
+  --accent-purple: #d2a8ff;
+  --accent-orange: #ffa657;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: #e6edf3;
+}
+
+::selection {
+  background: rgba(88, 166, 255, 0.3);
+}
+
+/* Scroll progress bar */
+.scroll-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-green), var(--accent-purple));
+  z-index: 100;
+  transition: width 0.1s;
+}
+
+/* KaTeX overrides for dark theme */
+.katex { color: #e6edf3; }
+.katex .mord { color: #e6edf3; }
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-12px); }
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { filter: drop-shadow(0 0 6px rgba(88,166,255,0.4)); }
+  50% { filter: drop-shadow(0 0 18px rgba(88,166,255,0.8)); }
+}

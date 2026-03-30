@@ -3,7 +3,7 @@ name: Deploy GitHub Pages
 on:
   push:
     branches: [main]
-    paths: [docs/**]
+    paths: [site/**]
   workflow_dispatch:
 
 permissions:
@@ -23,9 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npx next build
+        working-directory: site
+        env:
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs
+          path: site/out
       - id: deployment
         uses: actions/deploy-pages@v4
