@@ -236,24 +236,19 @@ def _quantize_weight(
 
 @torch.no_grad()
 def save_quantized(model: nn.Module, config: TurboQuantConfig, save_dir: str | Path):
-    """Save quantized model to disk.
+    """Save quantized model to disk in safetensors format.
 
     Directory structure:
         save_dir/
         ├── turboquant_config.json
-        ├── codebook.pt
-        ├── layers/
-        │   ├── {name}.indices.pt
-        │   ├── {name}.norms.pt
-        │   ├── {name}.bias.pt           (optional)
-        │   ├── {name}.pass2_indices.pt  (optional, residual)
-        │   ├── {name}.pass2_norms.pt    (optional, residual)
-        │   └── {name}.pass2_codebook.pt (optional, residual)
-        └── non_quantized.pt
+        ├── model.safetensors          # all quantized layer tensors + codebook
+        ├── non_quantized.safetensors  # non-linear params (embeddings, norms, etc.)
+        └── config.json                # (optional) HuggingFace model config
     """
+    from safetensors.torch import save_file
+
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    (save_dir / "layers").mkdir(exist_ok=True)
 
     config.save(save_dir / "turboquant_config.json")
 
@@ -261,42 +256,45 @@ def save_quantized(model: nn.Module, config: TurboQuantConfig, save_dir: str | P
     if hasattr(model, "config"):
         model.config.save_pretrained(save_dir)
 
+    tensors = {}
     codebook_saved = False
-    non_quantized = {}
     tq_param_prefixes = set()
 
     for name, module in model.named_modules():
         if isinstance(module, TurboQuantLinear):
             safe = name.replace(".", "_")
-            torch.save(module.indices_packed.cpu(), save_dir / "layers" / f"{safe}.indices.pt")
-            torch.save(module.weight_norms.cpu(), save_dir / "layers" / f"{safe}.norms.pt")
+            tensors[f"{safe}.indices"] = module.indices_packed.cpu().contiguous()
+            tensors[f"{safe}.norms"] = module.weight_norms.cpu().contiguous()
 
             if module.bias is not None:
-                torch.save(module.bias.cpu(), save_dir / "layers" / f"{safe}.bias.pt")
+                tensors[f"{safe}.bias"] = module.bias.cpu().contiguous()
 
             if module.has_residual:
-                torch.save(module.pass2_indices_packed.cpu(), save_dir / "layers" / f"{safe}.pass2_indices.pt")
-                torch.save(module.pass2_weight_norms.cpu(), save_dir / "layers" / f"{safe}.pass2_norms.pt")
-                torch.save(module.pass2_codebook.cpu(), save_dir / "layers" / f"{safe}.pass2_codebook.pt")
+                tensors[f"{safe}.pass2_indices"] = module.pass2_indices_packed.cpu().contiguous()
+                tensors[f"{safe}.pass2_norms"] = module.pass2_weight_norms.cpu().contiguous()
+                tensors[f"{safe}.pass2_codebook"] = module.pass2_codebook.cpu().clone()
 
             if not codebook_saved:
-                torch.save(module.codebook.cpu(), save_dir / "codebook.pt")
+                tensors["codebook"] = module.codebook.cpu().clone()
                 codebook_saved = True
 
             tq_param_prefixes.add(name + ".")
 
+    save_file(tensors, save_dir / "model.safetensors")
+
     # Collect non-quantized parameters
+    non_quantized = {}
     for pname, param in model.named_parameters():
         is_tq = any(pname.startswith(prefix) for prefix in tq_param_prefixes)
         if not is_tq:
-            non_quantized[pname] = param.data.cpu()
+            non_quantized[pname] = param.data.cpu().contiguous()
 
     for bname, buf in model.named_buffers():
         is_tq = any(bname.startswith(prefix) for prefix in tq_param_prefixes)
         if not is_tq and bname not in non_quantized:
-            non_quantized[bname] = buf.cpu()
+            non_quantized[bname] = buf.cpu().contiguous()
 
-    torch.save(non_quantized, save_dir / "non_quantized.pt")
+    save_file(non_quantized, save_dir / "non_quantized.safetensors")
 
     total = sum(f.stat().st_size for f in save_dir.rglob("*") if f.is_file())
     logger.info(f"Saved quantized model to {save_dir} ({total / 1024**2:.1f} MB)")
@@ -309,6 +307,9 @@ def load_quantized(
     device: str = "cuda",
 ) -> nn.Module:
     """Load a pre-quantized model from disk.
+
+    Supports both safetensors format (model.safetensors) and legacy
+    .pt format (layers/*.pt).
 
     Args:
         model_name_or_path: HF model name or path (for architecture)
@@ -331,7 +332,17 @@ def load_quantized(
 
     model = AutoModelForCausalLM.from_config(model_config).to(torch.bfloat16).to(device)
 
-    codebook = torch.load(quantized_dir / "codebook.pt", map_location=device, weights_only=True)
+    # Detect format: safetensors vs legacy .pt
+    safetensors_path = quantized_dir / "model.safetensors"
+    use_safetensors = safetensors_path.exists()
+
+    if use_safetensors:
+        from safetensors.torch import load_file
+        tensors = load_file(str(safetensors_path), device=device)
+        codebook = tensors["codebook"]
+    else:
+        tensors = None
+        codebook = torch.load(quantized_dir / "codebook.pt", map_location=device, weights_only=True)
 
     layers_dir = quantized_dir / "layers"
 
@@ -344,9 +355,15 @@ def load_quantized(
             continue
 
         safe = name.replace(".", "_")
-        indices_path = layers_dir / f"{safe}.indices.pt"
-        if not indices_path.exists():
-            continue
+
+        if use_safetensors:
+            indices_key = f"{safe}.indices"
+            if indices_key not in tensors:
+                continue
+        else:
+            indices_path = layers_dir / f"{safe}.indices.pt"
+            if not indices_path.exists():
+                continue
 
         M, N = module.weight.shape
         group_size = config.group_size or N
@@ -361,31 +378,57 @@ def load_quantized(
             rotation=config.rotation,
         )
 
-        tq.indices_packed = torch.load(indices_path, map_location=device, weights_only=True)
-        tq.weight_norms = torch.load(layers_dir / f"{safe}.norms.pt", map_location=device, weights_only=True)
+        if use_safetensors:
+            tq.indices_packed = tensors[f"{safe}.indices"]
+            tq.weight_norms = tensors[f"{safe}.norms"]
+        else:
+            tq.indices_packed = torch.load(layers_dir / f"{safe}.indices.pt", map_location=device, weights_only=True)
+            tq.weight_norms = torch.load(layers_dir / f"{safe}.norms.pt", map_location=device, weights_only=True)
+
         tq.codebook = codebook
 
         if module.bias is not None:
-            bias_path = layers_dir / f"{safe}.bias.pt"
-            if bias_path.exists():
-                tq.bias = torch.load(bias_path, map_location=device, weights_only=True)
+            if use_safetensors:
+                bias_key = f"{safe}.bias"
+                if bias_key in tensors:
+                    tq.bias = tensors[bias_key]
+            else:
+                bias_path = layers_dir / f"{safe}.bias.pt"
+                if bias_path.exists():
+                    tq.bias = torch.load(bias_path, map_location=device, weights_only=True)
 
         tq.set_rotation(config.seed)
 
         # Load residual pass if present
-        pass2_path = layers_dir / f"{safe}.pass2_indices.pt"
-        if pass2_path.exists():
-            tq.set_pass2(
-                indices_packed=torch.load(pass2_path, map_location=device, weights_only=True),
-                weight_norms=torch.load(layers_dir / f"{safe}.pass2_norms.pt", map_location=device, weights_only=True),
-                codebook=torch.load(layers_dir / f"{safe}.pass2_codebook.pt", map_location=device, weights_only=True),
-                seed=config.residual_seed,
-            )
+        if use_safetensors:
+            pass2_key = f"{safe}.pass2_indices"
+            if pass2_key in tensors:
+                tq.set_pass2(
+                    indices_packed=tensors[pass2_key],
+                    weight_norms=tensors[f"{safe}.pass2_norms"],
+                    codebook=tensors[f"{safe}.pass2_codebook"],
+                    seed=config.residual_seed,
+                )
+        else:
+            pass2_path = layers_dir / f"{safe}.pass2_indices.pt"
+            if pass2_path.exists():
+                tq.set_pass2(
+                    indices_packed=torch.load(pass2_path, map_location=device, weights_only=True),
+                    weight_norms=torch.load(layers_dir / f"{safe}.pass2_norms.pt", map_location=device, weights_only=True),
+                    codebook=torch.load(layers_dir / f"{safe}.pass2_codebook.pt", map_location=device, weights_only=True),
+                    seed=config.residual_seed,
+                )
 
         _replace_module(model, name, tq)
 
     # Load non-quantized parameters
-    remaining = torch.load(quantized_dir / "non_quantized.pt", map_location=device, weights_only=True)
+    non_quantized_st = quantized_dir / "non_quantized.safetensors"
+    if non_quantized_st.exists():
+        from safetensors.torch import load_file
+        remaining = load_file(str(non_quantized_st), device=device)
+    else:
+        remaining = torch.load(quantized_dir / "non_quantized.pt", map_location=device, weights_only=True)
+
     for pname, tensor in remaining.items():
         parts = pname.split(".")
         parent = model

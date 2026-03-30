@@ -205,22 +205,29 @@ Merging trades a small accuracy loss for halved inference latency and storage.
 
 ## Saved Format
 
-`save_quantized()` writes the following directory structure:
+`save_quantized()` writes the following directory structure using safetensors:
 
 ```
 output_dir/
 ├── turboquant_config.json         # TurboQuantConfig (JSON)
-├── codebook.pt                    # Shared codebook tensor
-├── layers/
-│   ├── {name}.indices.pt          # Packed 4-bit indices
-│   ├── {name}.norms.pt            # Per-row/group norms
-│   ├── {name}.bias.pt             # (optional) bias vector
-│   ├── {name}.pass2_indices.pt    # (optional) residual indices
-│   ├── {name}.pass2_norms.pt      # (optional) residual norms
-│   └── {name}.pass2_codebook.pt   # (optional) residual codebook
-├── non_quantized.pt               # Non-linear params (LayerNorm, embeddings, etc.)
+├── model.safetensors              # All quantized layer tensors + codebook
+├── non_quantized.safetensors      # Non-linear params (LayerNorm, embeddings, etc.)
 └── config.json                    # (optional) HuggingFace model config
 ```
+
+The `model.safetensors` file contains tensors keyed by layer name:
+
+| Key pattern | Dtype | Content |
+|-------------|-------|---------|
+| `codebook` | float32 | Shared Lloyd-Max centroids |
+| `{name}.indices` | uint8 | Packed 4-bit indices (M, N/2) |
+| `{name}.norms` | float32 | Per-row/group norms |
+| `{name}.bias` | float32 | (optional) bias vector |
+| `{name}.pass2_indices` | uint8 | (optional) residual packed indices |
+| `{name}.pass2_norms` | float32 | (optional) residual norms |
+| `{name}.pass2_codebook` | float32 | (optional) residual codebook |
+
+`load_quantized()` also supports the legacy `.pt` format (per-file `layers/` directory) for backward compatibility.
 
 **Implementation:** `model.py → save_quantized()` / `load_quantized()`
 

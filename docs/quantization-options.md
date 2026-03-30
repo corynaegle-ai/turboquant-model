@@ -151,22 +151,29 @@ W_merged = merge_residual_passes(packed)
 
 ## Disk Layout
 
-When saving via `save_quantized()`, the directory structure is:
+When saving via `save_quantized()`, the directory structure uses safetensors:
 
 ```
 save_dir/
 ├── turboquant_config.json       # TurboQuantConfig as JSON
 ├── config.json                  # HuggingFace model config (for architecture)
-├── codebook.pt                  # (16,) float32 — Lloyd-Max centroids (pass 1)
-├── layers/
-│   ├── {name}.indices.pt        # (M, N/2) uint8 — packed 4-bit indices
-│   ├── {name}.norms.pt          # (M,) or (M, n_groups) float32 — row norms
-│   ├── {name}.bias.pt           # (M,) float32 — optional, if layer had bias
-│   ├── {name}.pass2_indices.pt  # (M, N/2) uint8 — residual pass indices (optional)
-│   ├── {name}.pass2_norms.pt    # (M, n_groups) float32 — residual norms (optional)
-│   └── {name}.pass2_codebook.pt # (16,) float32 — residual codebook (optional)
-└── non_quantized.pt             # dict of non-Linear parameters (embeddings, LN, etc.)
+├── model.safetensors            # All quantized layer tensors + codebook
+└── non_quantized.safetensors    # Non-linear parameters (embeddings, LN, etc.)
 ```
+
+Tensor keys inside `model.safetensors`:
+
+| Key | Shape | Dtype | Description |
+|-----|-------|-------|-------------|
+| `codebook` | $(2^b,)$ | float32 | Lloyd-Max centroids (pass 1) |
+| `{name}.indices` | $(M, N/2)$ | uint8 | Packed 4-bit indices |
+| `{name}.norms` | $(M,)$ or $(M, G)$ | float32 | Row / group norms |
+| `{name}.bias` | $(M,)$ | float32 | Optional, if layer had bias |
+| `{name}.pass2_indices` | $(M, N/2)$ | uint8 | Residual pass indices (optional) |
+| `{name}.pass2_norms` | $(M, G)$ | float32 | Residual norms (optional) |
+| `{name}.pass2_codebook` | $(2^{b_2},)$ | float32 | Residual codebook (optional) |
+
+Loading also supports the legacy per-file `.pt` format (`layers/` directory) for backward compatibility.
 
 **Layer naming:** Module names like `model.layers.0.self_attn.q_proj` become `model_layers_0_self_attn_q_proj` (dots → underscores).
 

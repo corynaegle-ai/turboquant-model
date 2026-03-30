@@ -15,3 +15,4 @@ logs
 site/node_modules/
 site/.next/
 site/out/
+tests/report_qwen3_5.json

@@ -31,16 +31,28 @@ import torch
 logger = logging.getLogger("turboquant_model")
 
 
+def _disable_fused_kernels(model):
+    """Force PyTorch fallback when fused GPU kernels are unavailable."""
+    from turboquant_model.module import TurboQuantLinear
+    for m in model.modules():
+        if isinstance(m, TurboQuantLinear):
+            m.use_cutile = False
+            m.use_triton = False
+
+
 def cmd_quantize(args: argparse.Namespace):
     """Quantize a model and save to disk."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from turboquant_model.model import TurboQuantConfig, quantize_model, save_quantized
 
+    device = args.device
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+
     logger.info(f"Loading model: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, trust_remote_code=True
-    ).cuda().eval()
+        args.model, dtype=dtype, trust_remote_code=True
+    ).to(device).eval()
 
     config = TurboQuantConfig(
         bit_width=args.bit_width,
@@ -58,12 +70,15 @@ def cmd_quantize(args: argparse.Namespace):
                 + (f"+{config.residual_bit_width}-bit residual" if config.residual_bit_width else ""))
     model = quantize_model(model, config)
 
+    if device == "cpu":
+        _disable_fused_kernels(model)
+
     logger.info(f"Saving to: {args.output}")
     save_quantized(model, config, args.output)
 
     # Quick sanity check
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    input_ids = tokenizer.encode("Hello world", return_tensors="pt").cuda()
+    input_ids = tokenizer.encode("Hello world", return_tensors="pt").to(device)
     with torch.no_grad():
         logits = model(input_ids).logits
     logger.info(f"Sanity check passed: logits shape {logits.shape}")
@@ -74,16 +89,19 @@ def cmd_eval(args: argparse.Namespace):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
 
+    device = args.device
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+
     if args.quantized:
         from turboquant_model.model import load_quantized
         logger.info(f"Loading quantized model from: {args.quantized}")
-        model = load_quantized(args.model, args.quantized, device="cuda")
+        model = load_quantized(args.model, args.quantized, device=device)
     else:
         from turboquant_model.model import TurboQuantConfig, quantize_model
         logger.info(f"Loading and quantizing model: {args.model}")
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, trust_remote_code=True
-        ).cuda().eval()
+            args.model, dtype=dtype, trust_remote_code=True
+        ).to(device).eval()
         config = TurboQuantConfig(
             bit_width=args.bit_width,
             group_size=args.group_size,
@@ -95,13 +113,16 @@ def cmd_eval(args: argparse.Namespace):
         )
         model = quantize_model(model, config)
 
+    if device == "cpu":
+        _disable_fused_kernels(model)
+
     # Load reference model for KLD computation
     ref_model = None
     if args.kld:
         logger.info(f"Loading reference model for KLD: {args.model}")
         ref_model = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, trust_remote_code=True
-        ).cuda().eval()
+            args.model, dtype=dtype, trust_remote_code=True
+        ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
@@ -122,7 +143,7 @@ def cmd_eval(args: argparse.Namespace):
     with torch.no_grad():
         for i in range(n_chunks):
             start = i * seq_len
-            chunk = input_ids[start : start + seq_len + 1].unsqueeze(0).cuda()
+            chunk = input_ids[start : start + seq_len + 1].unsqueeze(0).to(device)
             outputs = model(chunk[:, :-1])
             logits = outputs.logits
             targets = chunk[:, 1:]
@@ -160,23 +181,29 @@ def cmd_generate(args: argparse.Namespace):
     """Generate text with a quantized model."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    device = args.device
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+
     if args.quantized:
         from turboquant_model.model import load_quantized
-        model = load_quantized(args.model, args.quantized, device="cuda")
+        model = load_quantized(args.model, args.quantized, device=device)
     else:
         from turboquant_model.model import TurboQuantConfig, quantize_model
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, trust_remote_code=True
-        ).cuda().eval()
+            args.model, dtype=dtype, trust_remote_code=True
+        ).to(device).eval()
         config = TurboQuantConfig(
             bit_width=args.bit_width,
             residual_bit_width=args.residual_bit_width,
         )
         model = quantize_model(model, config)
 
+    if device == "cpu":
+        _disable_fused_kernels(model)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    input_ids = tokenizer.encode(args.prompt, return_tensors="pt").cuda()
+    input_ids = tokenizer.encode(args.prompt, return_tensors="pt").to(device)
 
     t0 = time.time()
     with torch.no_grad():
@@ -201,9 +228,12 @@ def cmd_benchmark(args: argparse.Namespace):
 
     from turboquant_model.model import TurboQuantConfig, quantize_model
 
+    device = args.device
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, trust_remote_code=True
-    ).cuda().eval()
+        args.model, dtype=dtype, trust_remote_code=True
+    ).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     config = TurboQuantConfig(
@@ -212,8 +242,12 @@ def cmd_benchmark(args: argparse.Namespace):
     )
     model = quantize_model(model, config)
 
-    torch.cuda.reset_peak_memory_stats()
-    input_ids = tokenizer.encode("The quick brown fox", return_tensors="pt").cuda()
+    if device == "cpu":
+        _disable_fused_kernels(model)
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    input_ids = tokenizer.encode("The quick brown fox", return_tensors="pt").to(device)
 
     # Warmup
     with torch.no_grad():
@@ -221,18 +255,27 @@ def cmd_benchmark(args: argparse.Namespace):
             model(input_ids)
 
     # Benchmark
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
     t0 = time.time()
     with torch.no_grad():
         for _ in range(args.n_iters):
             model(input_ids)
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
     elapsed = time.time() - t0
 
-    mem_base = torch.cuda.memory_allocated() / 1024**2
-    mem_peak = torch.cuda.max_memory_allocated() / 1024**2
-
-    print(f"Memory: {mem_base:.0f} MB base, {mem_peak:.0f} MB peak")
+    if device == "cuda":
+        mem_base = torch.cuda.memory_allocated() / 1024**2
+        mem_peak = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"Memory: {mem_base:.0f} MB base, {mem_peak:.0f} MB peak")
+    else:
+        try:
+            import psutil, os
+            rss = psutil.Process(os.getpid()).memory_info().rss / 1024**2
+            print(f"Memory (RSS): {rss:.0f} MB")
+        except ImportError:
+            print("Memory: psutil not available")
     print(f"Latency: {elapsed / args.n_iters * 1000:.1f} ms/forward")
 
 
@@ -248,6 +291,7 @@ def main():
     p_quant = subparsers.add_parser("quantize", help="Quantize a model and save")
     p_quant.add_argument("--model", required=True, help="HF model name or path")
     p_quant.add_argument("--output", required=True, help="Output directory")
+    p_quant.add_argument("--device", default="cuda", help="Device: cuda or cpu")
     p_quant.add_argument("--bit-width", type=int, default=4)
     p_quant.add_argument("--group-size", type=int, default=None)
     p_quant.add_argument("--seed", type=int, default=42)
@@ -265,6 +309,7 @@ def main():
     # --- eval ---
     p_eval = subparsers.add_parser("eval", help="Evaluate PPL on WikiText-103")
     p_eval.add_argument("--model", required=True, help="HF model name or path")
+    p_eval.add_argument("--device", default="cuda", help="Device: cuda or cpu")
     p_eval.add_argument("--quantized", default=None, help="Quantized model dir (skip live quant)")
     p_eval.add_argument("--bit-width", type=int, default=4)
     p_eval.add_argument("--group-size", type=int, default=None)
@@ -283,6 +328,7 @@ def main():
     # --- generate ---
     p_gen = subparsers.add_parser("generate", help="Generate text")
     p_gen.add_argument("--model", required=True, help="HF model name or path")
+    p_gen.add_argument("--device", default="cuda", help="Device: cuda or cpu")
     p_gen.add_argument("--quantized", default=None, help="Quantized model dir")
     p_gen.add_argument("--bit-width", type=int, default=4)
     p_gen.add_argument("--residual-bit-width", type=int, default=None)
@@ -293,6 +339,7 @@ def main():
     # --- benchmark ---
     p_bench = subparsers.add_parser("benchmark", help="Benchmark memory and latency")
     p_bench.add_argument("--model", required=True, help="HF model name or path")
+    p_bench.add_argument("--device", default="cuda", help="Device: cuda or cpu")
     p_bench.add_argument("--bit-width", type=int, default=4)
     p_bench.add_argument("--residual-bit-width", type=int, default=None)
     p_bench.add_argument("--n-iters", type=int, default=10)

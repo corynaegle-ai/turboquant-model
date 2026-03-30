@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "scipy",
     "triton>=3.0",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
