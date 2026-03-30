@@ -4,6 +4,8 @@ Near-optimal weight quantization with on-the-fly dequantization for LLM inferenc
 
 Based on: [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025)
 
+Site: https://cksac.github.io/turboquant-model/
+
 ## Features
 
 - **4-bit weight quantization** with near-optimal MSE distortion (within 2.7x of information-theoretic lower bound)
