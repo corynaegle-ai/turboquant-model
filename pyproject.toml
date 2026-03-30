@@ -21,6 +21,9 @@ transformers = [
 cutile = [
     "cuda-tile[tileiras]",
 ]
+metal = [
+    "pyobjc-framework-Metal>=10.0",
+]
 dev = [
     "pytest",
     "pytest-cov",

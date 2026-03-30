@@ -31,8 +31,17 @@ import torch
 logger = logging.getLogger("turboquant_model")
 
 
+def _auto_device() -> str:
+    """Auto-detect the best available device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _disable_fused_kernels(model):
-    """Force PyTorch fallback when fused GPU kernels are unavailable."""
+    """Disable GPU-only fused kernels (cuTile, Triton). Preserves Metal on macOS."""
     from turboquant_model.module import TurboQuantLinear
     for m in model.modules():
         if isinstance(m, TurboQuantLinear):
@@ -46,8 +55,8 @@ def cmd_quantize(args: argparse.Namespace):
 
     from turboquant_model.model import TurboQuantConfig, quantize_model, save_quantized
 
-    device = args.device
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    device = args.device or _auto_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     logger.info(f"Loading model: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -72,6 +81,8 @@ def cmd_quantize(args: argparse.Namespace):
 
     if device == "cpu":
         _disable_fused_kernels(model)
+    elif device == "mps":
+        _disable_fused_kernels(model)  # keep Metal
 
     logger.info(f"Saving to: {args.output}")
     save_quantized(model, config, args.output)
@@ -89,8 +100,8 @@ def cmd_eval(args: argparse.Namespace):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
 
-    device = args.device
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    device = args.device or _auto_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     if args.quantized:
         from turboquant_model.model import load_quantized
@@ -113,7 +124,7 @@ def cmd_eval(args: argparse.Namespace):
         )
         model = quantize_model(model, config)
 
-    if device == "cpu":
+    if device in ("cpu", "mps"):
         _disable_fused_kernels(model)
 
     # Load reference model for KLD computation
@@ -181,8 +192,8 @@ def cmd_generate(args: argparse.Namespace):
     """Generate text with a quantized model."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    device = args.device
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    device = args.device or _auto_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     if args.quantized:
         from turboquant_model.model import load_quantized
@@ -198,7 +209,7 @@ def cmd_generate(args: argparse.Namespace):
         )
         model = quantize_model(model, config)
 
-    if device == "cpu":
+    if device in ("cpu", "mps"):
         _disable_fused_kernels(model)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -228,8 +239,8 @@ def cmd_benchmark(args: argparse.Namespace):
 
     from turboquant_model.model import TurboQuantConfig, quantize_model
 
-    device = args.device
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    device = args.device or _auto_device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=dtype, trust_remote_code=True
@@ -242,7 +253,7 @@ def cmd_benchmark(args: argparse.Namespace):
     )
     model = quantize_model(model, config)
 
-    if device == "cpu":
+    if device in ("cpu", "mps"):
         _disable_fused_kernels(model)
 
     if device == "cuda":
@@ -291,7 +302,7 @@ def main():
     p_quant = subparsers.add_parser("quantize", help="Quantize a model and save")
     p_quant.add_argument("--model", required=True, help="HF model name or path")
     p_quant.add_argument("--output", required=True, help="Output directory")
-    p_quant.add_argument("--device", default="cuda", help="Device: cuda or cpu")
+    p_quant.add_argument("--device", default=None, help="Device: cuda, mps, or cpu (auto-detected)")
     p_quant.add_argument("--bit-width", type=int, default=4)
     p_quant.add_argument("--group-size", type=int, default=None)
     p_quant.add_argument("--seed", type=int, default=42)
@@ -309,7 +320,7 @@ def main():
     # --- eval ---
     p_eval = subparsers.add_parser("eval", help="Evaluate PPL on WikiText-103")
     p_eval.add_argument("--model", required=True, help="HF model name or path")
-    p_eval.add_argument("--device", default="cuda", help="Device: cuda or cpu")
+    p_eval.add_argument("--device", default=None, help="Device: cuda, mps, or cpu (auto-detected)")
     p_eval.add_argument("--quantized", default=None, help="Quantized model dir (skip live quant)")
     p_eval.add_argument("--bit-width", type=int, default=4)
     p_eval.add_argument("--group-size", type=int, default=None)
@@ -328,7 +339,7 @@ def main():
     # --- generate ---
     p_gen = subparsers.add_parser("generate", help="Generate text")
     p_gen.add_argument("--model", required=True, help="HF model name or path")
-    p_gen.add_argument("--device", default="cuda", help="Device: cuda or cpu")
+    p_gen.add_argument("--device", default=None, help="Device: cuda, mps, or cpu (auto-detected)")
     p_gen.add_argument("--quantized", default=None, help="Quantized model dir")
     p_gen.add_argument("--bit-width", type=int, default=4)
     p_gen.add_argument("--residual-bit-width", type=int, default=None)
@@ -339,7 +350,7 @@ def main():
     # --- benchmark ---
     p_bench = subparsers.add_parser("benchmark", help="Benchmark memory and latency")
     p_bench.add_argument("--model", required=True, help="HF model name or path")
-    p_bench.add_argument("--device", default="cuda", help="Device: cuda or cpu")
+    p_bench.add_argument("--device", default=None, help="Device: cuda, mps, or cpu (auto-detected)")
     p_bench.add_argument("--bit-width", type=int, default=4)
     p_bench.add_argument("--residual-bit-width", type=int, default=None)
     p_bench.add_argument("--n-iters", type=int, default=10)

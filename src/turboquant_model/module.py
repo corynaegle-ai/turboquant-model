@@ -25,11 +25,11 @@ from turboquant_model.rotation import (
 from turboquant_model.quantize import unpack_4bit, pack_4bit
 from turboquant_model.codebook import get_codebook
 
-# Try to import fused kernels — prefers cuTile > Triton > PyTorch fallback
+# Try to import fused kernels — prefers cuTile > Triton > Metal > PyTorch fallback
 _HAS_CUTILE = False
 try:
-    from turboquant_model.cutile_kernels import cutile_fused_matmul
-    _HAS_CUTILE = True
+    from turboquant_model.cutile_kernels import cutile_fused_matmul, _CUTILE_AVAILABLE
+    _HAS_CUTILE = _CUTILE_AVAILABLE
 except ImportError:
     pass
 
@@ -37,6 +37,13 @@ _HAS_TRITON = False
 try:
     from turboquant_model.triton_kernels import triton_fused_matmul
     _HAS_TRITON = True
+except ImportError:
+    pass
+
+_HAS_METAL = False
+try:
+    from turboquant_model.metal_kernels import metal_fused_matmul, _METAL_AVAILABLE
+    _HAS_METAL = _METAL_AVAILABLE
 except ImportError:
     pass
 
@@ -123,9 +130,10 @@ class TurboQuantLinear(nn.Module):
         self._cached_pass2_indices: Optional[torch.Tensor] = None
         self._n_groups: int = math.ceil(in_features / self.group_size)
 
-        # Fused kernel priority: cuTile > Triton > PyTorch fallback
+        # Fused kernel priority: cuTile > Triton > Metal > PyTorch fallback
         self.use_cutile: bool = _HAS_CUTILE
         self.use_triton: bool = _HAS_TRITON
+        self.use_metal: bool = _HAS_METAL
 
     def set_rotation(self, seed: int):
         self._rotation_seed = seed
@@ -243,6 +251,13 @@ class TurboQuantLinear(nn.Module):
                     x_rot_g.contiguous(), packed_g.contiguous(),
                     codebook, norms_g.contiguous(), g_dim, scale,
                 )
+            elif self.use_metal and g_dim == self.group_size:
+                # Metal fused path: unpack + codebook lookup + matmul in one kernel
+                packed_g = indices_packed[:, g_start // 2 : g_end // 2]
+                out_g = metal_fused_matmul(
+                    x_rot_g.contiguous(), packed_g.contiguous(),
+                    codebook, norms_g.contiguous(), g_dim, scale,
+                )
             else:
                 # PyTorch fallback: explicit unpack + lookup + matmul
                 if indices is None:
@@ -269,7 +284,7 @@ class TurboQuantLinear(nn.Module):
         x_f = x.float()
 
         # Pass 1
-        _use_fused = self.use_cutile or self.use_triton
+        _use_fused = self.use_cutile or self.use_triton or self.use_metal
         indices = None if _use_fused else self._get_indices()
         output = self._forward_pass(
             x_f, indices, self.indices_packed, self.codebook,
