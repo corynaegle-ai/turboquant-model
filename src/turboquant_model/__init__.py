@@ -37,6 +37,22 @@ from turboquant_model.model import (
     quantize_model,
     save_quantized,
     load_quantized,
+    quantize_moe_model,
+    save_moe_quantized,
+    load_moe_quantized,
+)
+from turboquant_model.moe import (
+    detect_moe_layers,
+    is_moe_model,
+    quantize_expert,
+    TurboQuantMoEExpert,
+    TurboQuantMoELayer,
+    MoELayerInfo,
+)
+from turboquant_model.offload import (
+    ExpertOffloadManager,
+    create_offload_manager,
+    save_experts_to_offload_dir,
 )
 
 __version__ = "0.1.0"
@@ -67,4 +83,18 @@ __all__ = [
     "quantize_model",
     "save_quantized",
     "load_quantized",
+    # MoE
+    "quantize_moe_model",
+    "save_moe_quantized",
+    "load_moe_quantized",
+    "detect_moe_layers",
+    "is_moe_model",
+    "quantize_expert",
+    "TurboQuantMoEExpert",
+    "TurboQuantMoELayer",
+    "MoELayerInfo",
+    # Offloading
+    "ExpertOffloadManager",
+    "create_offload_manager",
+    "save_experts_to_offload_dir",
 ]

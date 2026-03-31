@@ -48,6 +48,11 @@ class TurboQuantConfig:
     #   "shared"    — both passes use the same seed (enables merge_and_requantize)
     #   "alternating" — even passes use seed, odd passes use residual_seed (for multi-pass)
     rotation_strategy: str = "different"
+    # MoE (Mixture of Experts) configuration
+    moe_offload: bool = False  # Enable expert offloading for MoE models
+    expert_cache_size: int = 16  # Number of experts to keep in GPU memory
+    offload_path: Optional[str] = None  # Path for mmap'd expert files
+    skip_moe_experts: bool = False  # Skip quantizing MoE experts (keep in bf16)
 
     def save(self, path: str | Path):
         with open(path, "w") as f:
@@ -443,6 +448,470 @@ def load_quantized(
 
     model.eval()
     logger.info(f"Loaded quantized model from {quantized_dir}")
+    return model
+
+
+# ---------------------------------------------------------------------------
+# MoE Model Quantization
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def quantize_moe_model(model: nn.Module, config: TurboQuantConfig) -> nn.Module:
+    """Quantize an MoE model with expert offloading support.
+    
+    Detects MoE layers and quantizes each expert independently.
+    Non-MoE layers (attention, embeddings) are quantized normally.
+    
+    Args:
+        model: HuggingFace MoE model (Mixtral, Qwen3-MoE, etc.)
+        config: TurboQuantConfig with MoE options
+    
+    Returns:
+        Quantized model with TurboQuantMoELayer modules
+    """
+    from turboquant_model.moe import (
+        detect_moe_layers,
+        quantize_expert,
+        TurboQuantMoEExpert,
+        TurboQuantMoELayer,
+        MoELayerInfo,
+    )
+    
+    # Detect MoE layers
+    moe_layers = detect_moe_layers(model)
+    
+    if not moe_layers:
+        logger.info("No MoE layers detected, using standard quantization")
+        return quantize_model(model, config)
+    
+    logger.info(f"Detected {len(moe_layers)} MoE layers with {moe_layers[0].num_experts} experts each")
+    
+    centroids, boundaries = get_codebook(config.bit_width)
+    
+    # First, quantize non-MoE linear layers
+    moe_expert_prefixes = set()
+    for moe_info in moe_layers:
+        for expert_name in moe_info.expert_names:
+            moe_expert_prefixes.add(expert_name)
+        if moe_info.router_name:
+            moe_expert_prefixes.add(moe_info.router_name)
+    
+    # Quantize non-MoE layers
+    non_moe_replaced = 0
+    replacements = []
+    
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if config.skip_embeddings and "embed" in name.lower():
+            continue
+        if config.skip_lm_head and "lm_head" in name.lower():
+            continue
+        
+        # Skip if part of MoE
+        is_moe = any(name.startswith(prefix) or prefix in name for prefix in moe_expert_prefixes)
+        if is_moe:
+            continue
+        
+        replacements.append((name, module))
+    
+    for name, module in replacements:
+        W = module.weight.data
+        M, N = W.shape
+        device = W.device
+        group_size = config.group_size or N
+        
+        pass1_packed, pass1_norms, pass1_codebook = _quantize_weight(
+            W, config.bit_width, group_size, config.seed, centroids, boundaries, device,
+            rotation=config.rotation,
+        )
+        
+        tq = TurboQuantLinear(
+            in_features=N,
+            out_features=M,
+            bias=module.bias is not None,
+            bit_width=config.bit_width,
+            group_size=group_size,
+            device=device,
+            rotation=config.rotation,
+        )
+        tq.indices_packed.copy_(pass1_packed)
+        tq.weight_norms.copy_(pass1_norms)
+        tq.codebook.copy_(centroids.to(device))
+        tq.set_rotation(config.seed)
+        
+        if module.bias is not None:
+            tq.bias.copy_(module.bias.data)
+        
+        _replace_module(model, name, tq)
+        non_moe_replaced += 1
+    
+    logger.info(f"Quantized {non_moe_replaced} non-MoE linear layers")
+    
+    # Now quantize MoE layers
+    moe_replaced = 0
+    total_experts = 0
+    
+    for moe_info in moe_layers:
+        # Get the parent MoE module
+        parts = moe_info.layer_name.split('.')
+        parent = model
+        for part in parts:
+            parent = getattr(parent, part)
+        
+        # Determine expert structure from first expert
+        first_expert_name = moe_info.expert_names[0]
+        first_expert = model
+        for part in first_expert_name.split('.'):
+            first_expert = getattr(first_expert, part)
+        
+        # Get dimensions
+        in_features = moe_info.expert_in_features
+        intermediate_size = moe_info.expert_out_features
+        
+        # Detect num_experts_per_tok from router if available
+        num_experts_per_tok = 2  # Default
+        if hasattr(parent, 'num_experts_per_tok'):
+            num_experts_per_tok = parent.num_experts_per_tok
+        elif hasattr(parent, 'top_k'):
+            num_experts_per_tok = parent.top_k
+        
+        # Create TurboQuantMoELayer
+        tq_moe = TurboQuantMoELayer(
+            num_experts=moe_info.num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            in_features=in_features,
+            intermediate_size=intermediate_size,
+            bit_width=config.bit_width,
+            group_size=config.group_size or 128,
+            rotation=config.rotation,
+            device=first_expert.gate_proj.weight.device if hasattr(first_expert, 'gate_proj') else first_expert.weight.device,
+        )
+        
+        # Copy router weights
+        if moe_info.router_name:
+            router_module = model
+            for part in moe_info.router_name.split('.'):
+                router_module = getattr(router_module, part)
+            if isinstance(router_module, nn.Linear):
+                tq_moe.router.weight.data.copy_(router_module.weight.data)
+        
+        # Quantize each expert
+        for i, expert_name in enumerate(moe_info.expert_names):
+            expert_module = model
+            for part in expert_name.split('.'):
+                expert_module = getattr(expert_module, part)
+            
+            # Quantize expert
+            expert_data = quantize_expert(
+                expert_module,
+                bit_width=config.bit_width,
+                group_size=config.group_size or 128,
+                seed=config.seed,
+                rotation=config.rotation,
+            )
+            expert_data.expert_id = i
+            
+            # Load into TurboQuantMoEExpert
+            tq_expert = tq_moe.experts[i]
+            tq_expert.codebook.copy_(centroids.to(tq_expert.codebook.device))
+            tq_expert.set_rotation(config.seed)
+            
+            tq_expert.load_weights(
+                gate_indices=expert_data.gate_indices,
+                gate_norms=expert_data.gate_norms,
+                gate_bias=expert_data.gate_bias,
+                up_indices=expert_data.up_indices,
+                up_norms=expert_data.up_norms,
+                up_bias=expert_data.up_bias,
+                down_indices=expert_data.down_indices,
+                down_norms=expert_data.down_norms,
+                down_bias=expert_data.down_bias,
+            )
+            
+            total_experts += 1
+        
+        # Replace the MoE module
+        _replace_module(model, moe_info.layer_name, tq_moe)
+        moe_replaced += 1
+    
+    logger.info(f"Quantized {moe_replaced} MoE layers ({total_experts} experts)")
+    
+    return model
+
+
+@torch.no_grad()
+def save_moe_quantized(
+    model: nn.Module,
+    config: TurboQuantConfig,
+    save_dir: str | Path,
+):
+    """Save a quantized MoE model with expert offloading support.
+    
+    Directory structure:
+        save_dir/
+        ├── turboquant_config.json
+        ├── model.safetensors          # Non-expert quantized layers
+        ├── non_quantized.safetensors  # Embeddings, norms, etc.
+        ├── experts/                    # Expert files for offloading
+        │   ├── layer_0/
+        │   │   ├── expert_0.tqe
+        │   │   ├── expert_1.tqe
+        │   │   └── ...
+        │   └── ...
+        └── config.json                # HF model config
+    """
+    from safetensors.torch import save_file
+    from turboquant_model.moe import TurboQuantMoELayer
+    from turboquant_model.offload import save_expert_file
+    
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    config.save(save_dir / "turboquant_config.json")
+    
+    # Save HF model config
+    if hasattr(model, "config"):
+        model.config.save_pretrained(save_dir)
+    
+    tensors = {}
+    codebook_saved = False
+    tq_param_prefixes = set()
+    moe_layer_idx = 0
+    
+    # Process modules
+    for name, module in model.named_modules():
+        if isinstance(module, TurboQuantMoELayer):
+            # Save router
+            safe = name.replace(".", "_")
+            tensors[f"{safe}.router.weight"] = module.router.weight.cpu().contiguous()
+            
+            # Save experts to offload directory
+            experts_dir = save_dir / "experts" / f"layer_{moe_layer_idx}"
+            experts_dir.mkdir(parents=True, exist_ok=True)
+            
+            for expert in module.experts:
+                save_expert_file(
+                    path=experts_dir / f"expert_{expert.expert_id}.tqe",
+                    expert_id=expert.expert_id,
+                    bit_width=config.bit_width,
+                    group_size=config.group_size or 128,
+                    in_features=module.in_features,
+                    intermediate_size=module.intermediate_size,
+                    gate_indices=expert._gate_indices,
+                    gate_norms=expert._gate_norms,
+                    up_indices=expert._up_indices,
+                    up_norms=expert._up_norms,
+                    down_indices=expert._down_indices,
+                    down_norms=expert._down_norms,
+                )
+            
+            # Save codebook
+            if not codebook_saved:
+                tensors["codebook"] = module.experts[0].codebook.cpu().clone()
+                codebook_saved = True
+            
+            tq_param_prefixes.add(name + ".")
+            moe_layer_idx += 1
+        
+        elif isinstance(module, TurboQuantLinear):
+            safe = name.replace(".", "_")
+            tensors[f"{safe}.indices"] = module.indices_packed.cpu().contiguous()
+            tensors[f"{safe}.norms"] = module.weight_norms.cpu().contiguous()
+            
+            if module.bias is not None:
+                tensors[f"{safe}.bias"] = module.bias.cpu().contiguous()
+            
+            if module.has_residual:
+                tensors[f"{safe}.pass2_indices"] = module.pass2_indices_packed.cpu().contiguous()
+                tensors[f"{safe}.pass2_norms"] = module.pass2_weight_norms.cpu().contiguous()
+                tensors[f"{safe}.pass2_codebook"] = module.pass2_codebook.cpu().clone()
+            
+            if not codebook_saved:
+                tensors["codebook"] = module.codebook.cpu().clone()
+                codebook_saved = True
+            
+            tq_param_prefixes.add(name + ".")
+    
+    save_file(tensors, save_dir / "model.safetensors")
+    
+    # Collect non-quantized parameters
+    non_quantized = {}
+    for pname, param in model.named_parameters():
+        is_tq = any(pname.startswith(prefix) for prefix in tq_param_prefixes)
+        if not is_tq:
+            non_quantized[pname] = param.data.cpu().contiguous()
+    
+    for bname, buf in model.named_buffers():
+        is_tq = any(bname.startswith(prefix) for prefix in tq_param_prefixes)
+        if not is_tq and bname not in non_quantized:
+            non_quantized[bname] = buf.cpu().contiguous()
+    
+    save_file(non_quantized, save_dir / "non_quantized.safetensors")
+    
+    total = sum(f.stat().st_size for f in save_dir.rglob("*") if f.is_file())
+    logger.info(f"Saved MoE quantized model to {save_dir} ({total / 1024**2:.1f} MB)")
+
+
+@torch.no_grad()
+def load_moe_quantized(
+    model_name_or_path: str,
+    quantized_dir: str | Path,
+    device: str = "cuda",
+    offload: bool = True,
+) -> nn.Module:
+    """Load a pre-quantized MoE model with optional expert offloading.
+    
+    Args:
+        model_name_or_path: HF model name or path (for architecture)
+        quantized_dir: directory with saved quantized weights
+        device: target device
+        offload: if True, use expert offloading (experts loaded on-demand)
+    
+    Returns:
+        Quantized MoE model ready for inference
+    """
+    from transformers import AutoModelForCausalLM, AutoConfig
+    from safetensors.torch import load_file
+    from turboquant_model.moe import TurboQuantMoELayer, TurboQuantMoEExpert
+    from turboquant_model.offload import ExpertOffloadManager, ExpertFileHeader
+    
+    quantized_dir = Path(quantized_dir)
+    config = TurboQuantConfig.load(quantized_dir / "turboquant_config.json")
+    
+    # Load architecture
+    if (quantized_dir / "config.json").exists():
+        model_config = AutoConfig.from_pretrained(quantized_dir)
+    else:
+        model_config = AutoConfig.from_pretrained(model_name_or_path)
+    
+    model = AutoModelForCausalLM.from_config(model_config).to(torch.bfloat16).to(device)
+    
+    # Load tensors
+    tensors = load_file(str(quantized_dir / "model.safetensors"), device=device)
+    codebook = tensors.get("codebook")
+    
+    # Check if this is an MoE model
+    experts_dir = quantized_dir / "experts"
+    is_moe = experts_dir.exists()
+    
+    if is_moe:
+        # Get MoE layer info from experts directory
+        moe_layers_info = {}
+        for layer_dir in sorted(experts_dir.iterdir()):
+            if layer_dir.is_dir() and layer_dir.name.startswith("layer_"):
+                layer_idx = int(layer_dir.name.split("_")[1])
+                expert_files = list(layer_dir.glob("expert_*.tqe"))
+                moe_layers_info[layer_idx] = len(expert_files)
+        
+        logger.info(f"Found {len(moe_layers_info)} MoE layers in {quantized_dir}")
+    
+    # Process modules
+    moe_layer_idx = 0
+    
+    for name, module in list(model.named_modules()):
+        safe = name.replace(".", "_")
+        
+        # Check if this is a router (MoE layer)
+        router_key = f"{safe}.router.weight"
+        if router_key in tensors:
+            # This is an MoE layer
+            # Reconstruct TurboQuantMoELayer
+            layer_dir = experts_dir / f"layer_{moe_layer_idx}"
+            expert_files = sorted(layer_dir.glob("expert_*.tqe"))
+            
+            # Read first expert header to get dimensions
+            with open(expert_files[0], 'rb') as f:
+                header = ExpertFileHeader.from_bytes(f.read(ExpertFileHeader.header_size()))
+            
+            num_experts = len(expert_files)
+            router_weight = tensors[router_key]
+            
+            tq_moe = TurboQuantMoELayer(
+                num_experts=num_experts,
+                num_experts_per_tok=2,  # Will be overridden by model config
+                in_features=header.in_features,
+                intermediate_size=header.intermediate_size,
+                bit_width=header.bit_width,
+                group_size=header.group_size,
+                rotation=config.rotation,
+                device=device,
+            )
+            
+            tq_moe.router.weight.data.copy_(router_weight)
+            
+            # Set codebook for all experts
+            for expert in tq_moe.experts:
+                expert.codebook.copy_(codebook)
+                expert.set_rotation(config.seed)
+            
+            _replace_module(model, name, tq_moe)
+            moe_layer_idx += 1
+            continue
+        
+        # Check if this is a regular TurboQuant layer
+        indices_key = f"{safe}.indices"
+        if indices_key in tensors:
+            if not isinstance(module, nn.Linear):
+                continue
+            
+            M, N = module.weight.shape
+            group_size = config.group_size or N
+            
+            tq = TurboQuantLinear(
+                in_features=N,
+                out_features=M,
+                bias=module.bias is not None,
+                bit_width=config.bit_width,
+                group_size=group_size,
+                device=device,
+                rotation=config.rotation,
+            )
+            
+            tq.indices_packed = tensors[f"{safe}.indices"]
+            tq.weight_norms = tensors[f"{safe}.norms"]
+            tq.codebook = codebook
+            
+            if module.bias is not None:
+                bias_key = f"{safe}.bias"
+                if bias_key in tensors:
+                    tq.bias = tensors[bias_key]
+            
+            tq.set_rotation(config.seed)
+            _replace_module(model, name, tq)
+    
+    # Load non-quantized parameters
+    non_quantized_path = quantized_dir / "non_quantized.safetensors"
+    if non_quantized_path.exists():
+        remaining = load_file(str(non_quantized_path), device=device)
+        for pname, tensor in remaining.items():
+            parts = pname.split(".")
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            target = getattr(parent, parts[-1], None)
+            if target is not None:
+                if isinstance(target, nn.Parameter):
+                    target.data.copy_(tensor)
+                elif isinstance(target, torch.Tensor):
+                    target.copy_(tensor)
+    
+    # Set up offload manager if requested
+    if is_moe and offload:
+        from turboquant_model.offload import create_offload_manager
+        
+        manager = create_offload_manager(
+            model=model,
+            offload_path=experts_dir,
+            cache_size=config.expert_cache_size,
+            device=device,
+        )
+        # Store manager on model for access
+        model._expert_offload_manager = manager
+    
+    model.eval()
+    logger.info(f"Loaded MoE quantized model from {quantized_dir}")
     return model
 
 
