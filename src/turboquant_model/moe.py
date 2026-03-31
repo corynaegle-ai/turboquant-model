@@ -93,7 +93,9 @@ def detect_moe_layers(model: nn.Module) -> List[MoELayerInfo]:
         for pattern in MOE_PATTERNS:
             if re.match(pattern, name):
                 # Extract the MoE layer prefix (everything before .experts.N)
-                match = re.match(r"(.+\.(?:experts|moe\.experts|mlp\.experts|block_sparse_moe\.experts))\.\d+", name)
+                # Match only the expert module itself, not its sub-modules
+                # e.g., "layers.0.block_sparse_moe.experts.0" but NOT "layers.0.block_sparse_moe.experts.0.gate_proj"
+                match = re.match(r"(.+\.(?:experts|moe\.experts|mlp\.experts|block_sparse_moe\.experts))\.(\d+)$", name)
                 if match:
                     layer_prefix = match.group(1).rsplit('.experts', 1)[0]
                     if layer_prefix not in expert_groups:
